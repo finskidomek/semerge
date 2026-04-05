@@ -1,0 +1,113 @@
+#!/bin/bash
+# SEMU v12.3 - "Auto-Infrastruktura & Clean-Env Edition"
+
+LISTA="/home/ghost/lista_do_rekompilacji.txt"
+LOG_HARD_ERROR="/home/ghost/pakiety_hard_error.txt"
+LOG_SUCCESS="/home/ghost/cbuild_success.txt"
+ENV_WHISPER="/etc/portage/package.env/whisper"
+ENV_COMPILER="/etc/portage/package.env/00compiler_switch"
+
+trap "echo -e '\n🛑 Przerwano. Zamykam.'; exit 1" SIGINT SIGTERM
+EMERGE_OPTS="-v --oneshot --with-bdeps=y --backtrack=30"
+
+# --- 0. BOOTSTRAP: TWORZENIE INFRASTRUKTURY ---
+echo "⚙️ Sprawdzam strukturę /etc/portage/..."
+sudo mkdir -p /etc/portage/env
+sudo mkdir -p /etc/portage/package.env
+
+# Tworzenie plików env, jeśli nie istnieją
+[ ! -f /etc/portage/env/no-lto.conf ] && echo -e "CFLAGS=\"\${CFLAGS} -fno-lto\"\nCXXFLAGS=\"\${CXXFLAGS} -fno-lto\"\nLDFLAGS=\"\${LDFLAGS} -fno-lto\"" | sudo tee /etc/portage/env/no-lto.conf
+[ ! -f /etc/portage/env/gcc-native.conf ] && echo -e "CC=\"x86_64-pc-linux-gnu-gcc\"\nCXX=\"x86_64-pc-linux-gnu-g++\"\nFC=\"x86_64-pc-linux-gnu-gfortran\"" | sudo tee /etc/portage/env/gcc-native.conf
+[ ! -f /etc/portage/env/light-gcc.conf ] && echo -e "CC=\"x86_64-pc-linux-gnu-gcc\"\nCXX=\"x86_64-pc-linux-gnu-g++\"\nCFLAGS=\"\${CFLAGS} -fno-lto -include stdint.h -fpermissive\"\nCXXFLAGS=\"\${CXXFLAGS} -fno-lto -include cstdint -fpermissive\"\nLDFLAGS=\"\${LDFLAGS} -fno-lto\"" | sudo tee /etc/portage/env/light-gcc.conf
+
+# Inicjalizacja plików mapowania
+[ ! -f "$ENV_WHISPER" ] && sudo touch "$ENV_WHISPER"
+[ ! -f "$ENV_COMPILER" ] && sudo touch "$ENV_COMPILER"
+
+# --- 1. GENEROWANIE LISTY ---
+if [[ -n "$*" ]]; then
+    echo "🔍 Generuję nową listę dla: $*"
+    > "$LOG_SUCCESS"
+    > "$LOG_HARD_ERROR"
+    emerge -p --quiet --color n --columns "$@" | grep -E '^  [A-Z]' | awk '{print $2}' > "$LISTA"
+    echo "✨ Pakietów do rzeźbienia: $(wc -l < "$LISTA")"
+fi
+
+if [ ! -s "$LISTA" ]; then
+    echo "❌ Lista pusta."
+    exit 1
+fi
+
+# --- 2. PĘTLA RZEŹBIARZA ---
+while [ -s "$LISTA" ]; do
+    DONE_OK=$(wc -l < "$LOG_SUCCESS" 2>/dev/null || echo 0)
+    DONE_FAIL=$(wc -l < "$LOG_HARD_ERROR" 2>/dev/null || echo 0)
+    REMAINING=$(wc -l < "$LISTA")
+
+    PKG=$(head -n 1 "$LISTA" | tr -d '\n\r' | xargs)
+    ATOM=$(echo "$PKG" | cut -d/ -f1,2 | sed 's/-[0-9].*//')
+
+    echo "----------------------------------------------------"
+    echo "📊 STATUS: OK: $DONE_OK | FAIL: $DONE_FAIL | Zostało: $REMAINING"
+    echo "🔨 Rzeźbię: $PKG"
+
+    # Funkcja czyszcząca stare wpisy dla pakietu
+    clean_env() {
+        sudo sed -i "\|^$ATOM |d" "$ENV_WHISPER"
+        sudo sed -i "\|^$ATOM |d" "$ENV_COMPILER"
+    }
+
+    # ETAP 0: Standard (Clang + LTO)
+    clean_env
+    if sudo emerge $EMERGE_OPTS "$PKG"; then
+        echo "✅ Sukces: $PKG"
+        echo "$PKG" >> "$LOG_SUCCESS"
+    else
+        [ $? -eq 130 ] && exit 130
+
+        # ETAP 1: NO-LTO
+        echo "⚠️ Próba no-lto..."
+        clean_env
+        echo "$ATOM no-lto.conf" | sudo tee -a "$ENV_WHISPER" > /dev/null
+        if sudo emerge $EMERGE_OPTS "$PKG"; then
+            echo "✅ Sukces (no-lto): $PKG"
+            echo "$PKG" >> "$LOG_SUCCESS"
+        else
+            [ $? -eq 130 ] && exit 130
+
+            # ETAP 2: GCC
+            echo "❌ Próba GCC..."
+            clean_env
+            echo "$ATOM gcc-native.conf" | sudo tee -a "$ENV_COMPILER" > /dev/null
+            if sudo emerge $EMERGE_OPTS "$PKG"; then
+                echo "✅ Sukces (GCC): $PKG"
+                echo "$PKG" >> "$LOG_SUCCESS"
+            else
+                [ $? -eq 130 ] && exit 130
+
+                # ETAP 3: LIGHT-GCC (GCC 15 Fix)
+                echo "🩹 Próba light-gcc..."
+                clean_env
+                echo "$ATOM light-gcc.conf" | sudo tee -a "$ENV_WHISPER" > /dev/null
+                if sudo emerge $EMERGE_OPTS "$PKG"; then
+                    echo "✅ Sukces (light-gcc): $PKG"
+                    echo "$PKG" >> "$LOG_SUCCESS"
+                else
+                    [ $? -eq 130 ] && exit 130
+
+                    # ETAP 4: LOKALNIE (BEZ DISTCC)
+                    echo "🏠 Próba lokalna (No-Distcc)..."
+                    if PORTAGE_TMPDIR="/var/tmp/portage_disk" sudo FEATURES="-distcc ccache" emerge $EMERGE_OPTS "$PKG"; then
+                        echo "✅ Sukces (Lokalnie): $PKG"
+                        echo "$PKG" >> "$LOG_SUCCESS"
+                    else
+                        echo "‼️ HARD ERROR: $PKG"
+                        echo "$PKG - $(date)" >> "$LOG_HARD_ERROR"
+                    fi
+                fi
+            fi
+        fi
+    fi
+    sed -i '1d' "$LISTA"
+done
+echo "🎉 Rzeźbienie zakończone!"
